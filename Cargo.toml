@@ -1,0 +1,25 @@
+[package]
+name = "quic-quinn"
+version = "0.1.0"
+authors = ["vjy <vijay@iavian.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+futures = "0.3.1"
+rcgen="0.7.0"
+quinn = { git = "https://github.com/djc/quinn", rev = "7a666c15e3ba6051c30c1d8b756802bd4237c7ac" }
+tokio = { version = "0.2.11", features = ["macros", "tcp", "dns", "io-util", "fs"] }
+tracing = "0.1.10"
+anyhow = "1.0.22"
+directories = "2.0.0"
+tracing-futures = { version = "0.2.0", default-features = false, features = ["std-future"] }
+unwrap = "1.2.1"
+ring = "0.16"
+mio = "0.6"
+quiche = "0.2.0"
+log = { version = "0.4", features = ["std"] }
+
+[profile.release]
+opt-level = 3
