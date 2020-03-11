@@ -347,7 +347,7 @@ fn main() {
                                 client,
                                 stream_id,
                                 &list,
-                                "examples/root",
+                                "www",
                             );
                         },
 
@@ -582,7 +582,7 @@ fn build_response(
                     file_path.push(v)
                 }
             }
-            warn!("Poda {:?}", file_path);
+            warn!("Poda {:?}", file_path.as_path());
             match std::fs::read(file_path.as_path()) {
                 Ok(data) => (200, data),
 
