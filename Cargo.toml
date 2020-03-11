@@ -10,7 +10,8 @@ edition = "2018"
 ring = "0.16"
 mio = "0.6"
 quiche = { git = "https://github.com/cloudflare/quiche", rev = "2f2dfab" }
-log = { version = "0.4", features = ["std"] }
+log = { version = "0.4.8", features = ["std", "max_level_trace","release_max_level_trace"] }
+url = "1"
 
 [profile.release]
 opt-level = 3
