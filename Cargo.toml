@@ -18,7 +18,7 @@ tracing-futures = { version = "0.2.0", default-features = false, features = ["st
 unwrap = "1.2.1"
 ring = "0.16"
 mio = "0.6"
-quiche = "0.2.0"
+quiche = { git = "https://github.com/cloudflare/quiche", rev = "2f2dfab" }
 log = { version = "0.4", features = ["std"] }
 
 [profile.release]

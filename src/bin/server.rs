@@ -1,25 +1,53 @@
+// Copyright (C) 2019, Cloudflare, Inc.
+// All rights reserved.
+//
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions are
+// met:
+//
+//     * Redistributions of source code must retain the above copyright notice,
+//       this list of conditions and the following disclaimer.
+//
+//     * Redistributions in binary form must reproduce the above copyright
+//       notice, this list of conditions and the following disclaimer in the
+//       documentation and/or other materials provided with the distribution.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS
+// IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO,
+// THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+// PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR
+// CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+// EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+// PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+// PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+// LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+// NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+// SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
 #[macro_use]
 extern crate log;
 
-use anyhow::{bail, Context, Result};
-use futures::{StreamExt, TryFutureExt};
-use quinn::{Endpoint, Incoming, ServerConfig, ServerConfigBuilder, TransportConfig};
-use ring::rand::*;
-use std::collections::HashMap;
 use std::net;
-use std::{error::Error, fs, net::SocketAddr, sync::Arc};
-use tokio::fs::File;
-use tokio::io;
+
+use std::collections::HashMap;
+
+use ring::rand::*;
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
 struct PartialResponse {
+    headers: Option<Vec<quiche::h3::Header>>,
+
     body: Vec<u8>,
+
     written: usize,
 }
 
 struct Client {
     conn: std::pin::Pin<Box<quiche::Connection>>,
+
+    http3_conn: Option<quiche::h3::Connection>,
+
     partial_responses: HashMap<u64, PartialResponse>,
 }
 
@@ -28,9 +56,24 @@ type ClientMap = HashMap<Vec<u8>, (net::SocketAddr, Client)>;
 fn main() {
     let mut buf = [0; 65535];
     let mut out = [0; MAX_DATAGRAM_SIZE];
+
+    let mut args = std::env::args();
+
+    let cmd = &args.next().unwrap();
+
+    if args.len() != 0 {
+        println!("Usage: {}", cmd);
+        println!("\nSee tools/apps/ for more complete implementations.");
+        return;
+    }
+
+    // Setup the event loop.
     let poll = mio::Poll::new().unwrap();
     let mut events = mio::Events::with_capacity(1024);
-    let socket = net::UdpSocket::bind("0.0.0.0:54321").unwrap();
+
+    // Create the UDP listening socket, and register it with the event loop.
+    let socket = net::UdpSocket::bind("127.0.0.1:4433").unwrap();
+
     let socket = mio::net::UdpSocket::from_socket(socket).unwrap();
     poll.register(
         &socket,
@@ -39,17 +82,21 @@ fn main() {
         mio::PollOpt::edge(),
     )
     .unwrap();
+
+    // Create the configuration for the QUIC connections.
     let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+
     config
-        .load_cert_chain_from_pem_file("/Users/iavian/quic.cert")
+        .load_cert_chain_from_pem_file("examples/cert.crt")
         .unwrap();
     config
-        .load_priv_key_from_pem_file("/Users/iavian/quic.key")
+        .load_priv_key_from_pem_file("examples/cert.key")
         .unwrap();
 
     config
-        .set_application_protos(b"\x05hq-27\x05hq-25\x05hq-24\x05hq-23\x08http/0.9")
+        .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
         .unwrap();
+
     config.set_idle_timeout(5000);
     config.set_max_packet_size(MAX_DATAGRAM_SIZE as u64);
     config.set_initial_max_data(10_000_000);
@@ -60,15 +107,21 @@ fn main() {
     config.set_initial_max_streams_uni(100);
     config.set_disable_active_migration(true);
     config.enable_early_data();
+
+    let h3_config = quiche::h3::Config::new().unwrap();
+
     let rng = SystemRandom::new();
-    let conn_id_seed = ring::hmac::Key::generate(ring::hmac::HMAC_SHA256, &rng).unwrap();
+    let conn_id_seed =
+        ring::hmac::Key::generate(ring::hmac::HMAC_SHA256, &rng).unwrap();
+
     let mut clients = ClientMap::new();
 
     loop {
         // Find the shorter timeout from all the active connections.
         //
         // TODO: use event loop that properly supports timers
-        let timeout = clients.values().filter_map(|(_, c)| c.conn.timeout()).min();
+        let timeout =
+            clients.values().filter_map(|(_, c)| c.conn.timeout()).min();
 
         poll.poll(&mut events, timeout).unwrap();
 
@@ -98,7 +151,7 @@ fn main() {
                     }
 
                     panic!("recv() failed: {:?}", e);
-                }
+                },
             };
 
             debug!("got {} bytes", len);
@@ -106,13 +159,16 @@ fn main() {
             let pkt_buf = &mut buf[..len];
 
             // Parse the QUIC packet's header.
-            let hdr = match quiche::Header::from_slice(pkt_buf, quiche::MAX_CONN_ID_LEN) {
+            let hdr = match quiche::Header::from_slice(
+                pkt_buf,
+                quiche::MAX_CONN_ID_LEN,
+            ) {
                 Ok(v) => v,
 
                 Err(e) => {
                     error!("Parsing packet header failed: {:?}", e);
                     continue;
-                }
+                },
             };
 
             trace!("got packet {:?}", hdr);
@@ -122,7 +178,8 @@ fn main() {
 
             // Lookup a connection based on the packet's connection ID. If there
             // is no connection matching, create a new one.
-            let (_, client) = if !clients.contains_key(&hdr.dcid) && !clients.contains_key(conn_id)
+            let (_, client) = if !clients.contains_key(&hdr.dcid) &&
+                !clients.contains_key(conn_id)
             {
                 if hdr.ty != quiche::Type::Initial {
                     error!("Packet is not Initial");
@@ -132,7 +189,9 @@ fn main() {
                 if !quiche::version_is_supported(hdr.version) {
                     warn!("Doing version negotiation");
 
-                    let len = quiche::negotiate_version(&hdr.scid, &hdr.dcid, &mut out).unwrap();
+                    let len =
+                        quiche::negotiate_version(&hdr.scid, &hdr.dcid, &mut out)
+                            .unwrap();
 
                     let out = &out[..len];
 
@@ -156,6 +215,23 @@ fn main() {
                 // Do stateless retry if the client didn't send a token.
                 if token.is_empty() {
                     warn!("Doing stateless retry");
+
+                    let new_token = mint_token(&hdr, &src);
+
+                    let len = quiche::retry(
+                        &hdr.scid, &hdr.dcid, &scid, &new_token, &mut out,
+                    )
+                    .unwrap();
+                    let out = &out[..len];
+
+                    if let Err(e) = socket.send_to(out, &src) {
+                        if e.kind() == std::io::ErrorKind::WouldBlock {
+                            debug!("send() would block");
+                            break;
+                        }
+
+                        panic!("send() failed: {:?}", e);
+                    }
                     continue;
                 }
 
@@ -187,6 +263,7 @@ fn main() {
 
                 let client = Client {
                     conn,
+                    http3_conn: None,
                     partial_responses: HashMap::new(),
                 };
 
@@ -208,38 +285,88 @@ fn main() {
                 Err(quiche::Error::Done) => {
                     debug!("{} done reading", client.conn.trace_id());
                     break;
-                }
+                },
 
                 Err(e) => {
                     error!("{} recv failed: {:?}", client.conn.trace_id(), e);
                     break 'read;
-                }
+                },
             };
 
             debug!("{} processed {} bytes", client.conn.trace_id(), read);
 
-            if client.conn.is_in_early_data() || client.conn.is_established() {
+            // Create a new HTTP/3 connection as soon as the QUIC connection
+            // is established.
+            if (client.conn.is_in_early_data() || client.conn.is_established()) &&
+                client.http3_conn.is_none()
+            {
+                debug!(
+                    "{} QUIC handshake completed, now trying HTTP/3",
+                    client.conn.trace_id()
+                );
+
+                let h3_conn = match quiche::h3::Connection::with_transport(
+                    &mut client.conn,
+                    &h3_config,
+                ) {
+                    Ok(v) => v,
+
+                    Err(e) => {
+                        error!("failed to create HTTP/3 connection: {}", e);
+                        break 'read;
+                    },
+                };
+
+                // TODO: sanity check h3 connection before adding to map
+                client.http3_conn = Some(h3_conn);
+            }
+
+            if client.http3_conn.is_some() {
                 // Handle writable streams.
                 for stream_id in client.conn.writable() {
-                   // handle_writable(client, stream_id);
+                    handle_writable(client, stream_id);
                 }
 
-                // Process all readable streams.
-                for s in client.conn.readable() {
-                    while let Ok((read, fin)) = client.conn.stream_recv(s, &mut buf) {
-                        debug!("{} received {} bytes", client.conn.trace_id(), read);
+                // Process HTTP/3 events.
+                loop {
+                    let http3_conn = client.http3_conn.as_mut().unwrap();
 
-                        let stream_buf = &buf[..read];
+                    match http3_conn.poll(&mut client.conn) {
+                        Ok((
+                            stream_id,
+                            quiche::h3::Event::Headers { list, .. },
+                        )) => {
+                            handle_request(
+                                client,
+                                stream_id,
+                                &list,
+                                "examples/root",
+                            );
+                        },
 
-                        debug!(
-                            "{} stream {} has {} bytes (fin? {})",
-                            client.conn.trace_id(),
-                            s,
-                            stream_buf.len(),
-                            fin
-                        );
+                        Ok((stream_id, quiche::h3::Event::Data)) => {
+                            info!(
+                                "{} got data on stream id {}",
+                                client.conn.trace_id(),
+                                stream_id
+                            );
+                        },
 
-                        handle_stream(client, s, stream_buf, "examples/root");
+                        Ok((_stream_id, quiche::h3::Event::Finished)) => (),
+
+                        Err(quiche::h3::Error::Done) => {
+                            break;
+                        },
+
+                        Err(e) => {
+                            error!(
+                                "{} HTTP/3 error {:?}",
+                                client.conn.trace_id(),
+                                e
+                            );
+
+                            break 'read;
+                        },
                     }
                 }
             }
@@ -256,14 +383,14 @@ fn main() {
                     Err(quiche::Error::Done) => {
                         debug!("{} done writing", client.conn.trace_id());
                         break;
-                    }
+                    },
 
                     Err(e) => {
                         error!("{} send failed: {:?}", client.conn.trace_id(), e);
 
                         client.conn.close(false, 0x1, b"fail").ok();
                         break;
-                    }
+                    },
                 };
 
                 // TODO: coalesce packets.
@@ -297,103 +424,37 @@ fn main() {
     }
 }
 
-#[tokio::main]
-async fn main1() -> Result<(), Box<dyn std::error::Error>> {
-    let server_addr = "0.0.0.0:54321".parse().unwrap();
-    let mut incoming = make_server_endpoint(server_addr)?;
+/// Generate a stateless retry token.
+///
+/// The token includes the static string `"quiche"` followed by the IP address
+/// of the client and by the original destination connection ID generated by the
+/// client.
+///
+/// Note that this function is only an example and doesn't do any cryptographic
+/// authenticate of the token. *It should not be used in production system*.
+fn mint_token(hdr: &quiche::Header, src: &net::SocketAddr) -> Vec<u8> {
+    let mut token = Vec::new();
 
-    while let Some(conn) = incoming.next().await {
-        println!("<<<incoming connection");
-        tokio::spawn(handle_connection(conn));
-    }
-    Ok(())
-}
+    token.extend_from_slice(b"quiche");
 
-fn make_server_endpoint(bind_addr: SocketAddr) -> Result<Incoming, Box<dyn Error>> {
-    let server_config = configure_server()?;
-    let mut endpoint_builder = Endpoint::builder();
-    endpoint_builder.listen(server_config);
-    let (_endpoint, incoming) = endpoint_builder.bind(&bind_addr)?;
-    println!("listening on {}", _endpoint.local_addr()?);
-    Ok(incoming)
-}
-
-fn configure_server() -> Result<ServerConfig> {
-    let dirs = directories::UserDirs::new().unwrap();
-    let path = dirs.home_dir();
-    let cert_path = path.join("cert.der");
-    let key_path = path.join("key.der");
-    let (cert, key) = match fs::read(&cert_path).and_then(|x| Ok((x, fs::read(&key_path)?))) {
-        Ok(x) => x,
-        Err(ref e) if e.kind() == io::ErrorKind::NotFound => {
-            println!("generating self-signed certificate");
-            let cert = rcgen::generate_simple_self_signed(vec!["quic.iavian.net".into()]).unwrap();
-            let key = cert.serialize_private_key_der();
-            let cert = cert.serialize_der().unwrap();
-            fs::create_dir_all(&path).context("failed to create certificate directory")?;
-            fs::write(&cert_path, &cert).context("failed to write certificate")?;
-            fs::write(&key_path, &key).context("failed to write private key")?;
-            (cert, key)
-        }
-        Err(e) => {
-            bail!("failed to read certificate: {}", e);
-        }
+    let addr = match src.ip() {
+        std::net::IpAddr::V4(a) => a.octets().to_vec(),
+        std::net::IpAddr::V6(a) => a.octets().to_vec(),
     };
-    let key = quinn::PrivateKey::from_der(&key)?;
-    let cert = quinn::Certificate::from_der(&cert)?;
-    let mut transport_config = TransportConfig::default();
-    transport_config.stream_window_uni(0);
-    let mut server_config = ServerConfig::default();
-    server_config.transport = Arc::new(transport_config);
-    let mut cfg_builder = ServerConfigBuilder::new(server_config);
-    cfg_builder.certificate(quinn::CertificateChain::from_certs(vec![cert]), key)?;
-    cfg_builder.protocols(&[b"i-send"]);
-    Ok(cfg_builder.build())
+
+    token.extend_from_slice(&addr);
+    token.extend_from_slice(&hdr.dcid);
+
+    token
 }
 
-async fn handle_connection(conn: quinn::Connecting) -> Result<()> {
-    let quinn::NewConnection { mut bi_streams, .. } = conn.await?;
-    async {
-        println!("connection established");
-
-        while let Some(stream) = bi_streams.next().await {
-            let stream = match stream {
-                Err(quinn::ConnectionError::ApplicationClosed { .. }) => {
-                    println!("connection closed");
-                    return Ok(());
-                }
-                Err(e) => {
-                    return Err(e);
-                }
-                Ok(s) => s,
-            };
-            println!("hello stream");
-            tokio::spawn(
-                handle_request(stream)
-                    .unwrap_or_else(move |e| println!("failed: {reason}", reason = e.to_string())),
-            );
-        }
-        Ok(())
-    }
-    .await?;
-    Ok(())
-}
-
-async fn handle_request(
-    (mut send, mut recv): (quinn::SendStream, quinn::RecvStream),
-) -> Result<()> {
-    let mut file = File::create("foo.txt").await?;
-    tokio::io::copy(&mut recv, &mut file).await?;
-    println!("Done file creation");
-    send.finish().await?;
-    Ok(())
-}
-
-fn hex_dump(buf: &[u8]) -> String {
-    let vec: Vec<String> = buf.iter().map(|b| format!("{:02x}", b)).collect();
-    vec.join("")
-}
-
+/// Validates a stateless retry token.
+///
+/// This checks that the ticket includes the `"quiche"` static string, and that
+/// the client IP address matches the address stored in the ticket.
+///
+/// Note that this function is only an example and doesn't do any cryptographic
+/// authenticate of the token. *It should not be used in production system*.
 fn validate_token<'a>(
     src: &net::SocketAddr, token: &'a [u8],
 ) -> Option<&'a [u8]> {
@@ -421,6 +482,169 @@ fn validate_token<'a>(
     Some(&token[..])
 }
 
-fn handle_stream(client: &mut Client, stream_id: u64, buf: &[u8], root: &str) {
+/// Handles incoming HTTP/3 requests.
+fn handle_request(
+    client: &mut Client, stream_id: u64, headers: &[quiche::h3::Header],
+    root: &str,
+) {
     let conn = &mut client.conn;
+    let http3_conn = &mut client.http3_conn.as_mut().unwrap();
+
+    info!(
+        "{} got request {:?} on stream id {}",
+        conn.trace_id(),
+        headers,
+        stream_id
+    );
+
+    // We decide the response based on headers alone, so stop reading the
+    // request stream so that any body is ignored and pointless Data events
+    // are not generated.
+    conn.stream_shutdown(stream_id, quiche::Shutdown::Read, 0)
+        .unwrap();
+
+    let (headers, body) = build_response(root, headers);
+
+    match http3_conn.send_response(conn, stream_id, &headers, false) {
+        Ok(v) => v,
+
+        Err(quiche::h3::Error::StreamBlocked) => {
+            let response = PartialResponse {
+                headers: Some(headers),
+                body,
+                written: 0,
+            };
+
+            client.partial_responses.insert(stream_id, response);
+            return;
+        },
+
+        Err(e) => {
+            error!("{} stream send failed {:?}", conn.trace_id(), e);
+            return;
+        },
+    }
+
+    let written = match http3_conn.send_body(conn, stream_id, &body, true) {
+        Ok(v) => v,
+
+        Err(e) => {
+            error!("{} stream send failed {:?}", conn.trace_id(), e);
+            return;
+        },
+    };
+
+    if written < body.len() {
+        let response = PartialResponse {
+            headers: None,
+            body,
+            written,
+        };
+
+        client.partial_responses.insert(stream_id, response);
+    }
+}
+
+/// Builds an HTTP/3 response given a request.
+fn build_response(
+    root: &str, request: &[quiche::h3::Header],
+) -> (Vec<quiche::h3::Header>, Vec<u8>) {
+    let mut file_path = std::path::PathBuf::from(root);
+    let mut path = std::path::Path::new("");
+    let mut method = "";
+
+    // Look for the request's path and method.
+    for hdr in request {
+        match hdr.name() {
+            ":path" => {
+                path = std::path::Path::new(hdr.value());
+            },
+
+            ":method" => {
+                method = hdr.value();
+            },
+
+            _ => (),
+        }
+    }
+
+    let (status, body) = match method {
+        "GET" => {
+            for c in path.components() {
+                if let std::path::Component::Normal(v) = c {
+                    file_path.push(v)
+                }
+            }
+
+            match std::fs::read(file_path.as_path()) {
+                Ok(data) => (200, data),
+
+                Err(_) => (404, b"Not Found!".to_vec()),
+            }
+        },
+
+        _ => (405, Vec::new()),
+    };
+
+    let headers = vec![
+        quiche::h3::Header::new(":status", &status.to_string()),
+        quiche::h3::Header::new("server", "quiche"),
+        quiche::h3::Header::new("content-length", &body.len().to_string()),
+    ];
+
+    (headers, body)
+}
+
+/// Handles newly writable streams.
+fn handle_writable(client: &mut Client, stream_id: u64) {
+    let conn = &mut client.conn;
+    let http3_conn = &mut client.http3_conn.as_mut().unwrap();
+
+    debug!("{} stream {} is writable", conn.trace_id(), stream_id);
+
+    if !client.partial_responses.contains_key(&stream_id) {
+        return;
+    }
+
+    let resp = client.partial_responses.get_mut(&stream_id).unwrap();
+
+    if let Some(ref headers) = resp.headers {
+        match http3_conn.send_response(conn, stream_id, &headers, false) {
+            Ok(_) => (),
+
+            Err(quiche::h3::Error::StreamBlocked) => {
+                return;
+            },
+
+            Err(e) => {
+                error!("{} stream send failed {:?}", conn.trace_id(), e);
+                return;
+            },
+        }
+    }
+
+    resp.headers = None;
+
+    let body = &resp.body[resp.written..];
+
+    let written = match http3_conn.send_body(conn, stream_id, body, true) {
+        Ok(v) => v,
+
+        Err(e) => {
+            error!("{} stream send failed {:?}", conn.trace_id(), e);
+            return;
+        },
+    };
+
+    resp.written += written;
+
+    if resp.written == resp.body.len() {
+        client.partial_responses.remove(&stream_id);
+    }
+}
+
+fn hex_dump(buf: &[u8]) -> String {
+    let vec: Vec<String> = buf.iter().map(|b| format!("{:02x}", b)).collect();
+
+    vec.join("")
 }
