@@ -582,7 +582,7 @@ fn build_response(
                     file_path.push(v)
                 }
             }
-            trace!("Poda {:?}", file_path);
+            warn!("Poda {:?}", file_path);
             match std::fs::read(file_path.as_path()) {
                 Ok(data) => (200, data),
 
