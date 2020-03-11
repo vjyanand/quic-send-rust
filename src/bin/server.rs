@@ -53,7 +53,14 @@ struct Client {
 
 type ClientMap = HashMap<Vec<u8>, (net::SocketAddr, Client)>;
 
+static LOGGER: SimpleLogger = SimpleLogger;
+
+use log::{ LevelFilter};
+
 fn main() {
+
+    log::set_logger(&LOGGER).map(|()| log::set_max_level(LevelFilter::Info)).unwrap();
+
     let mut buf = [0; 65535];
     let mut out = [0; MAX_DATAGRAM_SIZE];
 
@@ -647,4 +654,21 @@ fn hex_dump(buf: &[u8]) -> String {
     let vec: Vec<String> = buf.iter().map(|b| format!("{:02x}", b)).collect();
 
     vec.join("")
+}
+
+struct SimpleLogger;
+use log::{Record, Level, Metadata};
+
+impl log::Log for SimpleLogger {
+    fn enabled(&self, metadata: &Metadata) -> bool {
+        metadata.level() <= Level::Trace
+    }
+
+    fn log(&self, record: &Record) {
+        if self.enabled(record.metadata()) {
+            println!("{} - {}", record.level(), record.args());
+        }
+    }
+
+    fn flush(&self) {}
 }
