@@ -23,7 +23,7 @@ async fn main() -> Result<()> {
         .add_certificate_authority(quinn::Certificate::from_der(&cert)?)
         .unwrap();
     endpoint.default_client_config(client_config.build());
-    let (endpoint, _) = endpoint.bind(&"[::]:0".parse().unwrap())?;
+    let (_, endpoint, _) = endpoint.bind(&"[::]:0".parse().unwrap())?;
 
     let server_details = "quic.iavian.net:54321";
     let mut addrs_iter = server_details.to_socket_addrs().unwrap();

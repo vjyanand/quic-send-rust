@@ -21,7 +21,7 @@ fn make_server_endpoint(bind_addr: SocketAddr) -> Result<Incoming, Box<dyn Error
     let server_config = configure_server()?;
     let mut endpoint_builder = Endpoint::builder();
     endpoint_builder.listen(server_config);
-    let (_endpoint, incoming) = endpoint_builder.bind(&bind_addr)?;
+    let (_, _endpoint, incoming) = endpoint_builder.bind(&bind_addr)?;
     println!("listening on {}", _endpoint.local_addr()?);
     Ok(incoming)
 }
@@ -50,7 +50,7 @@ fn configure_server() -> Result<ServerConfig> {
     let key = quinn::PrivateKey::from_der(&key)?;
     let cert = quinn::Certificate::from_der(&cert)?;
     let mut transport_config = TransportConfig::default();
-    transport_config.stream_window_uni(0);
+    transport_config.stream_window_uni = 0;
     let mut server_config = ServerConfig::default();
     server_config.transport = Arc::new(transport_config);
     let mut cfg_builder = ServerConfigBuilder::new(server_config);
