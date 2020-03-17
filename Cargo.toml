@@ -9,7 +9,7 @@ edition = "2018"
 [dependencies]
 futures = "0.3.4"
 rcgen="0.7.0"
-quinn = { git = "https://github.com/djc/quinn", rev = "0ff3d8f51db767e7ac6b963ead07ae25c384882a" }
+quinn = { git = "https://github.com/djc/quinn", rev = "b73bb8553a68c61a6dedf74d77f772139e1a72d7" }
 tokio = { version = "0.2.13", features = ["macros", "fs"] }
 tracing = "0.1.10"
 anyhow = "1.0.22"
